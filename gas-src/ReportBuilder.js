@@ -101,16 +101,53 @@ function buildStoreReportsPhase_(state, config, deadline) {
   return { done: true };
 }
 
+/**
+ * 店舗・AM・B長PDFはいずれも「1つの使い回しシートへ内容を書き換えてPDF
+ * エクスポートする」方式で生成する。ファイルをレポートの数だけ新規作成すると
+ * SlidesApp.create等の1日あたり呼び出し回数クォータをすぐに使い切ってしまう
+ * ため(実際に第32回検証で発生)、create系呼び出しは初回の1回だけに抑える。
+ */
+function getOrCreateRenderSheet_() {
+  var props = PropertiesService.getScriptProperties();
+  var key = 'RENDER_SHEET_ID';
+  var existing = props.getProperty(key);
+  if (existing) {
+    try { return SpreadsheetApp.openById(existing); } catch (e) { /* 作り直す */ }
+  }
+  var ss = SpreadsheetApp.create('【PDFレンダリング用】eNPSレポート');
+  var file = DriveApp.getFileById(ss.getId());
+  getWorkFolder_().addFile(file);
+  DriveApp.getRootFolder().removeFile(file);
+  ss.getSheets()[0].setName('render');
+  props.setProperty(key, ss.getId());
+  return ss;
+}
+
+/**
+ * タイトル+本文行を使い回しシートへ書き込み、その場でPDFとしてエクスポートする。
+ */
+function renderTextReportPdf_(title, bodyLines, targetFolder, fileName) {
+  var ss = getOrCreateRenderSheet_();
+  var sheet = ss.getSheetByName('render');
+  sheet.clear();
+  sheet.setColumnWidth(1, 640);
+
+  sheet.getRange(1, 1).setValue(title).setFontSize(16).setFontWeight('bold');
+  if (bodyLines.length > 0) {
+    var rows = bodyLines.map(function (l) { return [l]; });
+    sheet.getRange(3, 1, rows.length, 1).setValues(rows).setFontSize(11).setWrap(true);
+  }
+  SpreadsheetApp.flush();
+
+  var pdfBlob = ss.getAs(MimeType.PDF);
+  var pdfFile = targetFolder.createFile(pdfBlob).setName(fileName);
+  return pdfFile;
+}
+
 function generateStoreReportPdf_(store, agg, config) {
   var brandFolder = getOrCreateNamedSubfolderOf_(getStoreReportFolder_(), normalizeBrandFolderName_(store.brand));
 
-  var pres = SlidesApp.create('tmp_store_' + store.storeCode);
-  var slide = pres.getSlides()[0];
-  slide.getShapes().forEach(function (sh) { sh.remove(); });
-
-  var title = slide.insertTextBox('eNPSレポート  ' + store.storeName + '（' + store.storeCode + '）', 20, 20, 600, 40);
-  title.getText().getTextStyle().setFontSize(20).setBold(true);
-
+  var title = 'eNPSレポート  ' + store.storeName + '（' + store.storeCode + '）';
   var body = [
     'AM: ' + (store.amName || '-') + '　ブロック: ' + (store.block || '-'),
     'B長: ' + (store.bLeaderName || '-'),
@@ -118,18 +155,9 @@ function generateStoreReportPdf_(store, agg, config) {
     '有効回答数: ' + (agg.responseCount || 0) + '人',
     'NPS: ' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps),
     '推奨: ' + (agg.promoters || 0) + '人　中立: ' + (agg.passives || 0) + '人　批判: ' + (agg.detractors || 0) + '人'
-  ].join('\n');
-  var box = slide.insertTextBox(body, 20, 80, 600, 200);
-  box.getText().getTextStyle().setFontSize(14);
-
-  pres.saveAndClose();
-
-  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
+  ];
   var fileName = store.storeCode + '_eNPS_第58期1回(32)_' + store.storeName + '_' + (store.directOrFc || '') + '.pdf';
-  var pdfFile = brandFolder.createFile(pdfBlob).setName(fileName);
-
-  DriveApp.getFileById(pres.getId()).setTrashed(true);
-  return pdfFile;
+  return renderTextReportPdf_(title, body, brandFolder, fileName);
 }
 
 function normalizeBrandFolderName_(brand) {
@@ -177,23 +205,13 @@ function buildAmReportsPhase_(state, config, deadline) {
 }
 
 function generateAmReportPdf_(amGroup, aggMap, config) {
-  var pres = SlidesApp.create('tmp_am_' + amGroup.amName);
-  var slide = pres.getSlides()[0];
-  slide.getShapes().forEach(function (sh) { sh.remove(); });
-  slide.insertTextBox('eNPS AMレポート　' + amGroup.amName, 20, 20, 600, 40)
-    .getText().getTextStyle().setFontSize(20).setBold(true);
-
+  var title = 'eNPS AMレポート　' + amGroup.amName;
   var lines = amGroup.stores.map(function (s) {
     var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
     return s.storeCode + ' ' + s.storeName + '  NPS:' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps) + '  回答数:' + (agg.responseCount || 0);
   });
-  slide.insertTextBox(lines.join('\n'), 20, 80, 600, 400).getText().getTextStyle().setFontSize(12);
-  pres.saveAndClose();
-
-  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
   var fileName = 'AM_' + amGroup.amName + '_eNPS_第58期1回(32).pdf';
-  getAmReportFolder_().createFile(pdfBlob).setName(fileName);
-  DriveApp.getFileById(pres.getId()).setTrashed(true);
+  return renderTextReportPdf_(title, lines, getAmReportFolder_(), fileName);
 }
 
 function buildBReportsPhase_(state, config, deadline) {
@@ -224,23 +242,13 @@ function buildBReportsPhase_(state, config, deadline) {
 }
 
 function generateBReportPdf_(bGroup, aggMap, config) {
-  var pres = SlidesApp.create('tmp_b_' + bGroup.bLeaderName);
-  var slide = pres.getSlides()[0];
-  slide.getShapes().forEach(function (sh) { sh.remove(); });
-  slide.insertTextBox('eNPS B長レポート　' + bGroup.bLeaderName, 20, 20, 600, 40)
-    .getText().getTextStyle().setFontSize(20).setBold(true);
-
+  var title = 'eNPS B長レポート　' + bGroup.bLeaderName;
   var lines = bGroup.stores.map(function (s) {
     var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
     return s.storeCode + ' ' + s.storeName + '  NPS:' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps) + '  回答数:' + (agg.responseCount || 0);
   });
-  slide.insertTextBox(lines.join('\n'), 20, 80, 600, 400).getText().getTextStyle().setFontSize(12);
-  pres.saveAndClose();
-
-  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
   var fileName = 'B長_' + bGroup.bLeaderName + '_eNPS_第58期1回(32).pdf';
-  getBReportFolder_().createFile(pdfBlob).setName(fileName);
-  DriveApp.getFileById(pres.getId()).setTrashed(true);
+  return renderTextReportPdf_(title, lines, getBReportFolder_(), fileName);
 }
 
 /**
