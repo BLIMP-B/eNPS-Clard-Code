@@ -243,14 +243,28 @@ function generateBReportPdf_(bGroup, aggMap, config) {
   DriveApp.getFileById(pres.getId()).setTrashed(true);
 }
 
+/**
+ * 本番のChat Webhook/メール宛先は検証ラウンドでは絶対に叩かない。
+ * NOTIFY_DRY_RUNをtrueにしている間はログへ記録するだけに留める。
+ * 本番運用に切り替える際は、この検証用ガードを明示的に外すこと。
+ */
+var NOTIFY_DRY_RUN = true;
+
 function notifyPhase_(state, config, deadline) {
   var webhookUrl = getConfigString_(config, 'CHAT_WEBHOOK_URL', '');
+  var message = 'eNPSレポート生成が完了しました(第32回検証)。';
+
+  if (NOTIFY_DRY_RUN) {
+    appendRunLog_('NOTIFY_DRY_RUN', 'webhook送信をスキップ(検証モード)。宛先: ' + webhookUrl);
+    return { done: true };
+  }
+
   if (webhookUrl) {
     try {
       UrlFetchApp.fetch(webhookUrl, {
         method: 'post',
         contentType: 'application/json',
-        payload: JSON.stringify({ text: 'eNPSレポート生成が完了しました(第32回検証)。' }),
+        payload: JSON.stringify({ text: message }),
         muteHttpExceptions: true
       });
     } catch (e) {

@@ -20,6 +20,9 @@ function resolveStoreMaster_(config) {
   var roster = readRosterStores_(rosterFile);
   var masterIndex = readMasterIndex_(masterFile);
 
+  var workforceFile = findFileByNameContains_(getInputFolder_(), '稼働数一覧');
+  var workforceIndex = workforceFile ? readWorkforceIndex_(workforceFile) : {};
+
   var invalidValues = getConfigString_(config, 'INVALID_STORE_SELECTION_VALUES', 'undefined')
     .split(',')
     .map(function (s) { return s.trim(); });
@@ -47,7 +50,7 @@ function resolveStoreMaster_(config) {
       amEmployeeId: m.amEmployeeId,
       managerName: m.managerName,
       bLeaderName: m.bLeaderName,
-      workforce: m.workforce
+      workforce: workforceIndex[String(r.storeCode)] !== undefined ? workforceIndex[String(r.storeCode)] : m.workforce
     });
   }
 
@@ -199,6 +202,38 @@ function readMasterIndex_(file) {
       bLeaderName: colIdx.bLeaderName >= 0 ? row[colIdx.bLeaderName] : '',
       workforce: colIdx.workforce >= 0 ? row[colIdx.workforce] : ''
     };
+  }
+  return index;
+}
+
+/**
+ * 「第n回eNPS稼働数一覧.xlsx」から店舗コード→稼働数のマップを読み込む。
+ * (マスタファイルには稼働数列が無いため、専用ファイルから取得する)
+ */
+function readWorkforceIndex_(file) {
+  var sheetId = convertXlsxToSheet_(file, 'workforce');
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheets()[0];
+  var values = sheet.getDataRange().getValues();
+
+  var headerRowIdx = -1, codeCol = -1, workforceCol = -1;
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    var cIdx = row.indexOf('CODE');
+    if (cIdx >= 0) {
+      headerRowIdx = r;
+      codeCol = cIdx;
+      workforceCol = row.indexOf('稼働数');
+      break;
+    }
+  }
+  if (headerRowIdx < 0 || workforceCol < 0) return {};
+
+  var index = {};
+  for (var r2 = headerRowIdx + 1; r2 < values.length; r2++) {
+    var code = values[r2][codeCol];
+    if (code === '' || code === null || code === undefined) continue;
+    index[String(code)] = values[r2][workforceCol];
   }
   return index;
 }

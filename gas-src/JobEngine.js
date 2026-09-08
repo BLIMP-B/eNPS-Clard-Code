@@ -113,16 +113,19 @@ function runJob() {
   if (!state.startedAt) state.startedAt = new Date().toISOString();
 
   Logger.log('runJob phase=%s runCount=%s budgetMs=%s', state.phase, state.runCount, budgetMs);
+  appendRunLog_('RUN_START', 'phase=' + state.phase + ' runCount=' + state.runCount);
 
   try {
     while (Date.now() < deadline && state.phase !== 'DONE') {
       var phaseFn = PHASE_HANDLERS_[state.phase];
       if (!phaseFn) throw new Error('未知のフェーズ: ' + state.phase);
 
+      var beforePhase = state.phase;
       var result = phaseFn(state, config, deadline);
       // フェーズ関数は {done:true} を返せば次フェーズへ、
       // {done:false} を返せば同一フェーズを維持したまま時間切れで抜ける。
       if (result && result.done) {
+        appendRunLog_('PHASE_DONE', beforePhase);
         state.phase = nextPhase_(state.phase);
         state.cursor = {};
       }
@@ -132,6 +135,7 @@ function runJob() {
   } catch (e) {
     state.errors.push({ at: new Date().toISOString(), phase: state.phase, message: String(e), stack: e.stack });
     saveJobState_(state);
+    appendRunLog_('ERROR', state.phase + ': ' + String(e) + '\n' + (e.stack || ''));
     scheduleResume_(1); // エラー時も再試行できるよう次回トリガーは張る
     throw e;
   }
@@ -139,10 +143,12 @@ function runJob() {
   if (state.phase === 'DONE') {
     clearAllTriggers_(JOB_TRIGGER_FUNCTION);
     Logger.log('ジョブ完了');
+    appendRunLog_('JOB_DONE', '');
     return;
   }
 
   // 時間切れ・未完了 → 次回再開トリガーを設定して終了
+  appendRunLog_('RUN_YIELD', 'phase=' + state.phase);
   scheduleResume_(1);
 }
 
