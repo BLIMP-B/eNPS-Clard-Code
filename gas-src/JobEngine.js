@@ -101,12 +101,20 @@ function runJob() {
   state.runCount = (state.runCount || 0) + 1;
 
   var isFirstRun = state.runCount === 1 && !state.startedAt;
-  var maxMinutes = isFirstRun
+  var configuredMaxMinutes = isFirstRun
     ? getConfigNumber_(config, 'INITIAL_MAX_MINUTES', 30)
     : getConfigNumber_(config, 'RESUME_MAX_MINUTES', 6);
   var safetySeconds = isFirstRun
     ? getConfigNumber_(config, 'INITIAL_SAFETY_SECONDS', 45)
     : getConfigNumber_(config, 'RESUME_SAFETY_SECONDS', 30);
+
+  // 個人Googleアカウントの実行時間上限は6分(Workspaceは30分)だが、
+  // GASからは実行環境の種別を判別できない。安全側に倒し、常に6分未満に
+  // 収まるようクランプする。これを超えるとGoogle側に強制終了され、
+  // 再開トリガーすら張れなくなるため(集計ロジック.xlsxのINITIAL_MAX_MINUTES=30は
+  // 参考値として尊重しつつ、実行時はこの安全上限で頭打ちにする)。
+  var HARD_CEILING_MINUTES = 5.5;
+  var maxMinutes = Math.min(configuredMaxMinutes, HARD_CEILING_MINUTES);
 
   var budgetMs = maxMinutes * 60 * 1000 - safetySeconds * 1000;
   var deadline = Date.now() + budgetMs;
