@@ -2,7 +2,7 @@
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--browser", "chromium"],
+      "args": ["-y", "@playwright/mcp@latest", "--headless", "--proxy-server", "http://127.0.0.1:33345"],
       "env": {
         "PLAYWRIGHT_BROWSERS_PATH": "/opt/pw-browsers",
         "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"
