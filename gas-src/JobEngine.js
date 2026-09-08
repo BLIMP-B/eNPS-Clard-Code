@@ -25,6 +25,39 @@ var JOB_PHASES = [
   'DONE'
 ];
 
+/**
+ * 各フェーズのハンドラ。すべて (state, config, deadline) を受け取り、
+ * {done:true} で次フェーズへ、{done:false} で時間切れ・同一フェーズ継続。
+ */
+var PHASE_HANDLERS_ = {
+  RESOLVE_STORE_MASTER: function (state, config, deadline) {
+    var stores = resolveStoreMaster_(config);
+    saveResolvedStores_(stores);
+    return { done: true };
+  },
+  INGEST_SURVEYS: function (state, config, deadline) {
+    return ingestSurveysPhase_(state, config, deadline);
+  },
+  AGGREGATE: function (state, config, deadline) {
+    return aggregatePhase_(state, config, deadline);
+  },
+  BUILD_SUMMARY: function (state, config, deadline) {
+    return buildSummaryPhase_(state, config, deadline);
+  },
+  BUILD_STORE_REPORTS: function (state, config, deadline) {
+    return buildStoreReportsPhase_(state, config, deadline);
+  },
+  BUILD_AM_REPORTS: function (state, config, deadline) {
+    return buildAmReportsPhase_(state, config, deadline);
+  },
+  BUILD_B_REPORTS: function (state, config, deadline) {
+    return buildBReportsPhase_(state, config, deadline);
+  },
+  NOTIFY: function (state, config, deadline) {
+    return notifyPhase_(state, config, deadline);
+  }
+};
+
 function getJobState_() {
   var raw = PropertiesService.getScriptProperties().getProperty(JOB_STATE_PROP);
   if (!raw) {

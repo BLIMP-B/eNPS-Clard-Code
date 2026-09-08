@@ -58,6 +58,33 @@ function resolveStoreMaster_(config) {
   return stores;
 }
 
+function saveResolvedStores_(stores) {
+  var props = PropertiesService.getScriptProperties();
+  var ss = SpreadsheetApp.create('【中間データ】確定店舗一覧');
+  var file = DriveApp.getFileById(ss.getId());
+  getWorkFolder_().addFile(file);
+  DriveApp.getRootFolder().removeFile(file);
+  var sheet = ss.getSheets()[0];
+  sheet.setName('resolved_stores');
+  sheet.appendRow(['storeCode', 'storeJson']);
+  var rows = stores.map(function (s) { return [s.storeCode, JSON.stringify(s)]; });
+  if (rows.length > 0) sheet.getRange(2, 1, rows.length, 2).setValues(rows);
+  props.setProperty('RESOLVED_STORES_SHEET_ID', ss.getId());
+}
+
+function loadResolvedStores_() {
+  var id = PropertiesService.getScriptProperties().getProperty('RESOLVED_STORES_SHEET_ID');
+  if (!id) throw new Error('確定店舗一覧が見つかりません(RESOLVE_STORE_MASTERフェーズ未完了)');
+  var ss = SpreadsheetApp.openById(id);
+  var sheet = ss.getSheetByName('resolved_stores');
+  var values = sheet.getDataRange().getValues();
+  var stores = [];
+  for (var r = 1; r < values.length; r++) {
+    stores.push(JSON.parse(values[r][1]));
+  }
+  return stores;
+}
+
 function findFileByNameContains_(folder, needle) {
   var it = folder.getFiles();
   var matches = [];

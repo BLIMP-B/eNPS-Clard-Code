@@ -1,0 +1,261 @@
+/**
+ * サマリ・店舗PDF・AM PDF・B長PDFの生成。
+ *
+ * v1方針: まず「実施店舗一覧」相当のサマリ表と、店舗ごとの主要指標を
+ * 正しく計算・出力するところまでを確実に動かす。PDFのビジュアル(チャート・
+ * レイアウト)は原本と完全一致ではなく、Google スライドの1ページ構成で
+ * 主要数値(NPS・回答率・要因スコア上位/下位)を表示する簡易版とし、
+ * パイプライン全体(店舗確定→集計→出力→通知)が正しく流れることを
+ * 最優先で検証する。ビジュアルは後続の反復で本番相当に近づける。
+ */
+
+function buildSummaryPhase_(state, config, deadline) {
+  var stores = loadResolvedStores_();
+  var aggMap = loadStoreAggregates_();
+  var lowRateThreshold = getConfigNumber_(config, 'LOW_RESPONSE_RATE_THRESHOLD', 0.5);
+
+  var ss = SpreadsheetApp.create('第32回_物語eNPS_実施店舗一覧');
+  var file = DriveApp.getFileById(ss.getId());
+  getSummaryFolder_().addFile(file);
+  DriveApp.getRootFolder().removeFile(file);
+
+  var sheet = ss.getSheets()[0];
+  sheet.setName('実施店舗一覧');
+  var header = ['店舗コード', '店舗名', '直営FC', '経営企業名', '業態', '事業部', 'AM', 'ブロック', 'B長',
+    '有効回答数', '稼働数', '回答率', 'NPS'];
+  sheet.appendRow(header);
+
+  var zeroResponseStores = [];
+  var lowResponseStores = [];
+
+  var rows = stores.map(function (s) {
+    var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
+    var workforce = Number(s.workforce) || 0;
+    var responseCount = agg.responseCount || 0;
+    var responseRate = workforce > 0 ? responseCount / workforce : 0;
+
+    if (responseCount === 0) zeroResponseStores.push(s);
+    else if (workforce > 0 && responseRate <= lowRateThreshold) lowResponseStores.push({ store: s, count: responseCount });
+
+    return [
+      s.storeCode, s.storeName, s.directOrFc, s.operatingCompany, s.brand, s.businessDivision,
+      s.amName, s.block, s.bLeaderName,
+      responseCount, workforce,
+      workforce > 0 ? Math.round(responseRate * 1000) / 10 + '%' : '-',
+      agg.nps === null || agg.nps === undefined ? '-' : agg.nps
+    ];
+  });
+
+  if (rows.length > 0) sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+
+  var lowRespText = buildLowResponseText_(zeroResponseStores, lowResponseStores);
+  var lowRespFile = DriveApp.createFile('回答数0、極少店舗リスト.txt', lowRespText, MimeType.PLAIN_TEXT);
+  getSummaryFolder_().addFile(lowRespFile);
+  DriveApp.getRootFolder().removeFile(lowRespFile);
+
+  PropertiesService.getScriptProperties().setProperty('ZERO_RESPONSE_STORES', JSON.stringify(zeroResponseStores.map(function (s) { return s.storeCode; })));
+
+  return { done: true };
+}
+
+function buildLowResponseText_(zeroStores, lowStores) {
+  var lines = [];
+  lines.push('回答数0、極少店舗リスト');
+  lines.push('');
+  lines.push('【回答数0】：レポートファイル発行なし');
+  zeroStores.forEach(function (s) {
+    lines.push(s.storeCode + ' ' + s.storeName + ' ' + (s.operatingCompany || s.directOrFc));
+  });
+  lines.push('');
+  lines.push('【回答数極少】：レポートファイル発行あり');
+  lowStores.forEach(function (item) {
+    lines.push(item.count + '件 ' + item.store.storeCode + ' ' + item.store.storeName + ' ' + (item.store.operatingCompany || item.store.directOrFc));
+  });
+  lines.push('');
+  lines.push('生成日時: ' + new Date().toISOString());
+  return lines.join('\n');
+}
+
+/**
+ * 店舗PDFをバッチ生成する。カーソル(処理済みインデックス)で中断・再開する。
+ */
+function buildStoreReportsPhase_(state, config, deadline) {
+  var stores = loadResolvedStores_();
+  var aggMap = loadStoreAggregates_();
+  var zeroResponseCodes = JSON.parse(PropertiesService.getScriptProperties().getProperty('ZERO_RESPONSE_STORES') || '[]');
+
+  if (!state.cursor.storeIdx) state.cursor.storeIdx = 0;
+
+  while (state.cursor.storeIdx < stores.length) {
+    if (Date.now() >= deadline) return { done: false };
+
+    var s = stores[state.cursor.storeIdx];
+    if (zeroResponseCodes.indexOf(s.storeCode) < 0) {
+      var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null, factorAnswers: {} };
+      generateStoreReportPdf_(s, agg, config);
+    }
+    state.cursor.storeIdx++;
+    saveJobState_(state);
+  }
+
+  return { done: true };
+}
+
+function generateStoreReportPdf_(store, agg, config) {
+  var brandFolder = getOrCreateNamedSubfolderOf_(getStoreReportFolder_(), normalizeBrandFolderName_(store.brand));
+
+  var pres = SlidesApp.create('tmp_store_' + store.storeCode);
+  var slide = pres.getSlides()[0];
+  slide.getShapes().forEach(function (sh) { sh.remove(); });
+
+  var title = slide.insertTextBox('eNPSレポート  ' + store.storeName + '（' + store.storeCode + '）', 20, 20, 600, 40);
+  title.getText().getTextStyle().setFontSize(20).setBold(true);
+
+  var body = [
+    'AM: ' + (store.amName || '-') + '　ブロック: ' + (store.block || '-'),
+    'B長: ' + (store.bLeaderName || '-'),
+    '',
+    '有効回答数: ' + (agg.responseCount || 0) + '人',
+    'NPS: ' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps),
+    '推奨: ' + (agg.promoters || 0) + '人　中立: ' + (agg.passives || 0) + '人　批判: ' + (agg.detractors || 0) + '人'
+  ].join('\n');
+  var box = slide.insertTextBox(body, 20, 80, 600, 200);
+  box.getText().getTextStyle().setFontSize(14);
+
+  pres.saveAndClose();
+
+  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
+  var fileName = store.storeCode + '_eNPS_第58期1回(32)_' + store.storeName + '_' + (store.directOrFc || '') + '.pdf';
+  var pdfFile = brandFolder.createFile(pdfBlob).setName(fileName);
+
+  DriveApp.getFileById(pres.getId()).setTrashed(true);
+  return pdfFile;
+}
+
+function normalizeBrandFolderName_(brand) {
+  var b = String(brand || '');
+  if (b.indexOf('きんぐ') >= 0 || b.indexOf('焼肉') >= 0) return '焼肉';
+  if (b.indexOf('丸源') >= 0) return '丸源';
+  if (b.indexOf('ゆず庵') >= 0) return 'ゆず庵';
+  if (b.indexOf('焼きたて') >= 0) return '焼きたて';
+  if (b.indexOf('お好み') >= 0) return 'お好み';
+  return 'その他';
+}
+
+function getOrCreateNamedSubfolderOf_(parentFolder, name) {
+  var it = parentFolder.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return parentFolder.createFolder(name);
+}
+
+function buildAmReportsPhase_(state, config, deadline) {
+  // v1: AM別ロールアップは店舗レポートと同様の簡易PDFで代替する。
+  var stores = loadResolvedStores_();
+  var aggMap = loadStoreAggregates_();
+
+  if (!state.cursor.amKeys) {
+    var byAm = {};
+    stores.forEach(function (s) {
+      var key = s.amEmployeeId || s.amName;
+      if (!key) return;
+      if (!byAm[key]) byAm[key] = { amName: s.amName, stores: [] };
+      byAm[key].stores.push(s);
+    });
+    state.cursor.amMap = byAm;
+    state.cursor.amKeys = Object.keys(byAm);
+    state.cursor.amIdx = 0;
+  }
+
+  while (state.cursor.amIdx < state.cursor.amKeys.length) {
+    if (Date.now() >= deadline) return { done: false };
+    var key = state.cursor.amKeys[state.cursor.amIdx];
+    generateAmReportPdf_(state.cursor.amMap[key], aggMap, config);
+    state.cursor.amIdx++;
+    saveJobState_(state);
+  }
+  return { done: true };
+}
+
+function generateAmReportPdf_(amGroup, aggMap, config) {
+  var pres = SlidesApp.create('tmp_am_' + amGroup.amName);
+  var slide = pres.getSlides()[0];
+  slide.getShapes().forEach(function (sh) { sh.remove(); });
+  slide.insertTextBox('eNPS AMレポート　' + amGroup.amName, 20, 20, 600, 40)
+    .getText().getTextStyle().setFontSize(20).setBold(true);
+
+  var lines = amGroup.stores.map(function (s) {
+    var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
+    return s.storeCode + ' ' + s.storeName + '  NPS:' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps) + '  回答数:' + (agg.responseCount || 0);
+  });
+  slide.insertTextBox(lines.join('\n'), 20, 80, 600, 400).getText().getTextStyle().setFontSize(12);
+  pres.saveAndClose();
+
+  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
+  var fileName = 'AM_' + amGroup.amName + '_eNPS_第58期1回(32).pdf';
+  getAmReportFolder_().createFile(pdfBlob).setName(fileName);
+  DriveApp.getFileById(pres.getId()).setTrashed(true);
+}
+
+function buildBReportsPhase_(state, config, deadline) {
+  var stores = loadResolvedStores_();
+  var aggMap = loadStoreAggregates_();
+
+  if (!state.cursor.bKeys) {
+    var byB = {};
+    stores.forEach(function (s) {
+      var key = s.bLeaderName;
+      if (!key) return;
+      if (!byB[key]) byB[key] = { bLeaderName: key, stores: [] };
+      byB[key].stores.push(s);
+    });
+    state.cursor.bMap = byB;
+    state.cursor.bKeys = Object.keys(byB);
+    state.cursor.bIdx = 0;
+  }
+
+  while (state.cursor.bIdx < state.cursor.bKeys.length) {
+    if (Date.now() >= deadline) return { done: false };
+    var key = state.cursor.bKeys[state.cursor.bIdx];
+    generateBReportPdf_(state.cursor.bMap[key], aggMap, config);
+    state.cursor.bIdx++;
+    saveJobState_(state);
+  }
+  return { done: true };
+}
+
+function generateBReportPdf_(bGroup, aggMap, config) {
+  var pres = SlidesApp.create('tmp_b_' + bGroup.bLeaderName);
+  var slide = pres.getSlides()[0];
+  slide.getShapes().forEach(function (sh) { sh.remove(); });
+  slide.insertTextBox('eNPS B長レポート　' + bGroup.bLeaderName, 20, 20, 600, 40)
+    .getText().getTextStyle().setFontSize(20).setBold(true);
+
+  var lines = bGroup.stores.map(function (s) {
+    var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
+    return s.storeCode + ' ' + s.storeName + '  NPS:' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps) + '  回答数:' + (agg.responseCount || 0);
+  });
+  slide.insertTextBox(lines.join('\n'), 20, 80, 600, 400).getText().getTextStyle().setFontSize(12);
+  pres.saveAndClose();
+
+  var pdfBlob = DriveApp.getFileById(pres.getId()).getAs(MimeType.PDF);
+  var fileName = 'B長_' + bGroup.bLeaderName + '_eNPS_第58期1回(32).pdf';
+  getBReportFolder_().createFile(pdfBlob).setName(fileName);
+  DriveApp.getFileById(pres.getId()).setTrashed(true);
+}
+
+function notifyPhase_(state, config, deadline) {
+  var webhookUrl = getConfigString_(config, 'CHAT_WEBHOOK_URL', '');
+  if (webhookUrl) {
+    try {
+      UrlFetchApp.fetch(webhookUrl, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ text: 'eNPSレポート生成が完了しました(第32回検証)。' }),
+        muteHttpExceptions: true
+      });
+    } catch (e) {
+      Logger.log('通知送信に失敗しました: ' + e);
+    }
+  }
+  return { done: true };
+}
