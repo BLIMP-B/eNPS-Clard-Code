@@ -198,14 +198,13 @@ function generateStoreReportPdf_(store, agg, config) {
   return renderTextReportPdf_(title, body, brandFolder, fileName);
 }
 
+/**
+ * 業態フォルダ名は固定リストを持たず、マスタファイルの「業態」列の値を
+ * そのまま使う。回によって存在する業態は変動するため、ここで固定化しない。
+ */
 function normalizeBrandFolderName_(brand) {
-  var b = String(brand || '');
-  if (b.indexOf('きんぐ') >= 0 || b.indexOf('焼肉') >= 0) return '焼肉';
-  if (b.indexOf('丸源') >= 0) return '丸源';
-  if (b.indexOf('ゆず庵') >= 0) return 'ゆず庵';
-  if (b.indexOf('焼きたて') >= 0) return '焼きたて';
-  if (b.indexOf('お好み') >= 0) return 'お好み';
-  return 'その他';
+  var b = String(brand || '').trim();
+  return b || 'その他';
 }
 
 function getOrCreateNamedSubfolderOf_(parentFolder, name) {
