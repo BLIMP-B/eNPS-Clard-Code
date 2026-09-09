@@ -33,7 +33,8 @@ function buildSummaryPhase_(state, config, deadline) {
     var agg = aggMap[s.storeCode] || { responseCount: 0, nps: null };
     var workforce = Number(s.workforce) || 0;
     var responseCount = agg.responseCount || 0;
-    var responseRate = workforce > 0 ? responseCount / workforce : 0;
+    var responseRateCap = getConfigNumber_(config, 'RESPONSE_RATE_CAP', 1);
+    var responseRate = workforce > 0 ? Math.min(responseCount / workforce, responseRateCap) : 0;
 
     if (responseCount === 0) zeroResponseStores.push(s);
     else if (workforce > 0 && responseRate <= lowRateThreshold) lowResponseStores.push({ store: s, count: responseCount });
@@ -153,6 +154,10 @@ function renderTextReportPdf_(title, bodyLines, targetFolder, fileName) {
  * 算出し、実際の設問文言を添えてスコア降順で返す。原本PDFの「自店舗比較」表に
  * 相当する情報(要因スコア降順の一覧)を、チャートではなくテキスト表として示す。
  */
+/**
+ * BASE_FACTOR(集計ロジック.xlsx 指標定義シート正本の要因スコア: リッカート点数
+ * [100/75/50/25/1]の平均値、0-100点)を、設問文言とともにスコア降順で返す。
+ */
 function computeFactorScoreRows_(agg) {
   var headers = loadSurveyHeaders_();
   var keys = Object.keys(agg.factorAnswers || {});
@@ -160,12 +165,10 @@ function computeFactorScoreRows_(agg) {
     var sep = key.lastIndexOf(':');
     var sourceKey = key.substring(0, sep);
     var colIdx = Number(key.substring(sep + 1));
-    var counts = agg.factorAnswers[key];
-    var total = counts.plus + counts.minus;
-    var score = total > 0 ? Math.round((counts.plus / total) * 1000) / 10 : null;
+    var f = agg.factorAnswers[key];
     var headerRow = headers[sourceKey];
     var label = headerRow && headerRow[colIdx] ? String(headerRow[colIdx]).replace(/（要因）$/, '') : key;
-    return { label: label, plus: counts.plus, minus: counts.minus, score: score };
+    return { label: label, score: f.baseFactor, plusCount: f.plusCount, minusCount: f.minusCount };
   });
   rows.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
   return rows;
@@ -185,13 +188,13 @@ function generateStoreReportPdf_(store, agg, config) {
     'NPS: ' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps),
     '批判: ' + (agg.detractors || 0) + '人　中立: ' + (agg.passives || 0) + '人　推奨: ' + (agg.promoters || 0) + '人',
     '',
-    '【自店舗比較 要因スコア(プラス回答割合、降順)】'
+    '【自店舗比較 要因スコア(BASE_FACTOR, 0-100点, 降順)】'
   ];
 
   var factorRows = computeFactorScoreRows_(agg);
   factorRows.forEach(function (r, i) {
     body.push((i + 1) + '. ' + r.label + '　' + (r.score === null ? '-' : r.score + '点') +
-      '（プラス' + r.plus + '／マイナス' + r.minus + '）');
+      '（プラス相当' + r.plusCount + '／マイナス相当' + r.minusCount + '）');
   });
 
   var fileName = store.storeCode + '_eNPS_第58期1回(32)_' + store.storeName + '_' + (store.directOrFc || '') + '.pdf';

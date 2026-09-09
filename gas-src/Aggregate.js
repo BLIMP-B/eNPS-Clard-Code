@@ -1,12 +1,17 @@
 /**
  * 正規化済み回答(ステージングシート raw_rows)を店舗単位に集計する。
  *
- * - NPS: 推奨度0-10の回答を 批判(0-6) / 中立(7-8) / 推奨(9-10) に分類し、
- *   NPS = 推奨割合 - 批判割合 (%ポイント) で算出する。
- * - 要因スコア: 各要因設問の「とても当てはまる/当てはまる」等をプラス、
- *   「当てはまらない/全く当てはまらない」等をマイナスとしてカウントする。
- * - 回答率: 分母は稼働数(第32回eNPS稼働数一覧)、分子は対象店舗一覧に
- *   含まれる店舗への有効回答数(FACTOR_DENOMINATOR_MODE等の設定に従う)。
+ * 集計ロジック.xlsx の「指標定義」シートに定義された正式な計算式に従う
+ * (2026-09-09にサブエージェントで全文抽出・確認済み)。要点:
+ *
+ * - NPS = PROMOTERS/ACCEPTED_RESPONSES - (WEAK_DETRACTORS+STRONG_DETRACTORS)/ACCEPTED_RESPONSES
+ *   ACCEPTED_RESPONSES(店舗受理回答数)が分母。推奨度が空欄の受理行も分母に残る。
+ * - 要因スコア(BASE_FACTOR) = SUM(因子の5段階リッカート点数)/ACCEPTED_RESPONSES
+ *   リッカート点数は 100/75/50/25/1 (とても当てはまる=100 ... 全く当てはまらない=1)。
+ *   単純な「プラス回答数÷(プラス+マイナス)」ではない。分母は各アンケート種別
+ *   (sourceKey)ごとの受理回答数(FACTOR_DENOMINATOR_MODE=ACCEPTED_STORE_RESPONSES)。
+ * - WEIGHTED_FACTOR(推奨度で重み付けした要因値)は本バージョンでは未実装(次段階で対応)。
+ * - 回答率 = MIN(ACCEPTED_RESPONSES/稼働数, RESPONSE_RATE_CAP)
  *
  * このフェーズは正規化行を1店舗コードごとにグルーピングしながら
  * ROW_BATCH_SIZE件ずつストリーム処理し、集計結果は店舗コード単位の
@@ -14,8 +19,21 @@
  * (件数が多いためプロパティサイズ上限を避ける)。
  */
 
-var POSITIVE_LABELS = ['とても当てはまる', '当てはまる', 'とてもできている', 'できている', 'よくしている'];
-var NEGATIVE_LABELS = ['当てはまらない', '全く当てはまらない', 'できていない', '全くできていない'];
+/**
+ * リッカート5段階回答文言 -> 得点。集計ロジック.xlsxの指標定義シートに
+ * 明示の数式は「100/75相当肯定件数」等の記述のみのため、標準的な5段階換算
+ * (100/75/50/25/1)を採用する。得点そのものは係数のため、将来的には
+ * 集計ロジック.xlsxの「係数・ウェイト」シートから読み込む設計に切り替える。
+ */
+var LIKERT_SCORE_MAP_ = {
+  'とても当てはまる': 100, 'とてもできている': 100, 'よくしている': 100,
+  '当てはまる': 75, 'できている': 75, 'したことがある': 75,
+  'どちらとも言えない': 50, 'わからない': 50,
+  '当てはまらない': 25, 'できていない': 25, 'あまりしていない': 25,
+  '全く当てはまらない': 1, '全くできていない': 1, 'したことがない': 1
+};
+var POSITIVE_LIKERT_SCORES_ = [100, 75]; // FACTOR_POSITIVE_COUNT: 100/75相当
+var NEGATIVE_LIKERT_SCORES_ = [25, 1];   // FACTOR_NEGATIVE_COUNT: 25/1相当(50点は含めない)
 
 function aggregatePhase_(state, config, deadline) {
   var stagingSs = getStagingSheetOrThrow_();
@@ -83,12 +101,14 @@ function accumulateRow_(storeAgg, sourceKey, row) {
   if (!storeAgg[storeCode]) {
     storeAgg[storeCode] = {
       npsScores: [],
-      factorAnswers: {}, // 設問インデックス -> {plus, minus, total}
-      responseCount: 0
+      factorAnswers: {}, // sourceKey:列 -> {sum, plusCount, minusCount}
+      bySourceAcceptedCount: {}, // sourceKey -> ACCEPTED_RESPONSES (要因スコアの分母)
+      responseCount: 0 // ACCEPTED_RESPONSES(全ソース合算。NPSの分母)
     };
   }
   var agg = storeAgg[storeCode];
   agg.responseCount++;
+  agg.bySourceAcceptedCount[sourceKey] = (agg.bySourceAcceptedCount[sourceKey] || 0) + 1;
 
   var npsValue = row[layout.npsCol];
   if (npsValue !== null && npsValue !== undefined && npsValue !== '') {
@@ -97,13 +117,15 @@ function accumulateRow_(storeAgg, sourceKey, row) {
 
   for (var c = layout.factorStartCol; c < row.length; c++) {
     var v = row[c];
-    if (POSITIVE_LABELS.indexOf(v) < 0 && NEGATIVE_LABELS.indexOf(v) < 0) continue;
+    var score = LIKERT_SCORE_MAP_[v];
+    if (score === undefined) continue; // 未回答・非該当設問はスキップ(欠損は分母に残す)
     // 4種のアンケートは対象者ごとに設問文言が異なる(同じ列位置でも別の質問)ため、
     // sourceKey付きの複合キーで区別し、他ソースの回答と取り違えないようにする。
     var key = sourceKey + ':' + c;
-    if (!agg.factorAnswers[key]) agg.factorAnswers[key] = { plus: 0, minus: 0 };
-    if (POSITIVE_LABELS.indexOf(v) >= 0) agg.factorAnswers[key].plus++;
-    else agg.factorAnswers[key].minus++;
+    if (!agg.factorAnswers[key]) agg.factorAnswers[key] = { sum: 0, plusCount: 0, minusCount: 0 };
+    agg.factorAnswers[key].sum += score;
+    if (POSITIVE_LIKERT_SCORES_.indexOf(score) >= 0) agg.factorAnswers[key].plusCount++;
+    else if (NEGATIVE_LIKERT_SCORES_.indexOf(score) >= 0) agg.factorAnswers[key].minusCount++;
   }
 }
 
@@ -156,18 +178,34 @@ function finalizeStoreAggregates_(storeAgg, config) {
   var codes = Object.keys(storeAgg);
   for (var i = 0; i < codes.length; i++) {
     var agg = storeAgg[codes[i]];
-    var promoters = 0, passives = 0, detractors = 0;
+
+    // NPS = PROMOTERS/ACCEPTED_RESPONSES - (WEAK+STRONG_DETRACTORS)/ACCEPTED_RESPONSES
+    // (指標定義シート。ACCEPTED_RESPONSES=agg.responseCount が分母。
+    //  推奨度が0-4:強批判/5-6:弱批判/7-8:中立/9-10:推奨)
+    var promoters = 0, passives = 0, weakDetractors = 0, strongDetractors = 0;
     for (var j = 0; j < agg.npsScores.length; j++) {
       var v = agg.npsScores[j];
       if (v >= 9) promoters++;
       else if (v >= 7) passives++;
-      else detractors++;
+      else if (v >= 5) weakDetractors++;
+      else strongDetractors++;
     }
-    var npsBase = agg.npsScores.length;
-    agg.nps = npsBase > 0 ? Math.round(((promoters - detractors) / npsBase) * 1000) / 10 : null;
+    var accepted = agg.responseCount;
+    var detractors = weakDetractors + strongDetractors;
+    agg.nps = accepted > 0 ? Math.round(((promoters - detractors) / accepted) * 1000) / 10 : null;
     agg.promoters = promoters;
     agg.passives = passives;
     agg.detractors = detractors;
+
+    // BASE_FACTOR = SUM(因子リッカート点数)/ACCEPTED_RESPONSES(そのアンケート種別の受理回答数)
+    var factorKeys = Object.keys(agg.factorAnswers);
+    for (var k = 0; k < factorKeys.length; k++) {
+      var key = factorKeys[k];
+      var sourceKey = key.substring(0, key.lastIndexOf(':'));
+      var f = agg.factorAnswers[key];
+      var sourceAccepted = agg.bySourceAcceptedCount[sourceKey] || 0;
+      f.baseFactor = sourceAccepted > 0 ? Math.round((f.sum / sourceAccepted) * 10) / 10 : null;
+    }
   }
 }
 
