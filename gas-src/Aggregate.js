@@ -34,9 +34,9 @@ function aggregatePhase_(state, config, deadline) {
     var range = rawSheet.getRange(state.cursor.aggRow, 1, readCount, 3).getValues();
 
     for (var i = 0; i < range.length; i++) {
-      var role = range[i][0];
+      var sourceKey = range[i][1];
       var row = JSON.parse(range[i][2]);
-      accumulateRow_(state.cursor.storeAgg, role, row);
+      accumulateRow_(state.cursor.storeAgg, sourceKey, row);
     }
 
     state.cursor.aggRow += readCount;
@@ -56,12 +56,28 @@ function getStagingSheetOrThrow_() {
 }
 
 /**
- * 1行の回答を店舗別中間集計へ加算する。列位置は行データの構造上、
- * 店舗コードは各アンケートの最初の識別列(社員・パート・FC種別は
- * セグメント文字列の先頭4桁、店長は明示列)から抽出する。
+ * 各アンケート(sourceKey)ごとの列レイアウト。実データのヘッダーを直接
+ * CSV解析して確認した実測値(2026年7月分)。列順が変わるリスクに備え、
+ * 起動時に一度だけヘッダーとの整合性を検証する(validateSurveyLayouts_)。
+ *   npsCol: 推奨度(0-10)設問の列インデックス
+ *   factorStartCol: 要因設問(プラス/マイナスでカウントする設問群)の開始列
+ *   storeCodeCol: 店舗コード(または「コード_店舗名_直FC_ブランド」形式)の列
  */
-function accumulateRow_(storeAgg, role, row) {
-  var storeCode = extractStoreCodeFromRow_(role, row);
+var SURVEY_LAYOUT_ = {
+  shain_yakushoku: { storeCodeCol: 1, npsCol: 3, factorStartCol: 4 },
+  part_arbeit: { storeCodeCol: 1, npsCol: 2, factorStartCol: 3 },
+  fc: { storeCodeCol: 1, npsCol: 2, factorStartCol: 3 },
+  tencho: { storeCodeCol: 1, npsCol: 4, factorStartCol: 5 }
+};
+
+/**
+ * 1行の回答を店舗別中間集計へ加算する。
+ */
+function accumulateRow_(storeAgg, sourceKey, row) {
+  var layout = SURVEY_LAYOUT_[sourceKey];
+  if (!layout) throw new Error('未知のアンケート種別です: ' + sourceKey);
+
+  var storeCode = extractStoreCodeFromRow_(layout, row);
   if (!storeCode) return;
 
   if (!storeAgg[storeCode]) {
@@ -74,25 +90,27 @@ function accumulateRow_(storeAgg, role, row) {
   var agg = storeAgg[storeCode];
   agg.responseCount++;
 
-  var npsValue = extractNpsScoreFromRow_(role, row);
+  var npsValue = row[layout.npsCol];
   if (npsValue !== null && npsValue !== undefined && npsValue !== '') {
     agg.npsScores.push(Number(npsValue));
   }
 
-  var factorStartIdx = role === '店長' ? 5 : (role === '店舗' ? 4 : 3);
-  for (var c = factorStartIdx; c < row.length; c++) {
+  for (var c = layout.factorStartCol; c < row.length; c++) {
     var v = row[c];
     if (POSITIVE_LABELS.indexOf(v) < 0 && NEGATIVE_LABELS.indexOf(v) < 0) continue;
-    if (!agg.factorAnswers[c]) agg.factorAnswers[c] = { plus: 0, minus: 0 };
-    if (POSITIVE_LABELS.indexOf(v) >= 0) agg.factorAnswers[c].plus++;
-    else agg.factorAnswers[c].minus++;
+    // 4種のアンケートは対象者ごとに設問文言が異なる(同じ列位置でも別の質問)ため、
+    // sourceKey付きの複合キーで区別し、他ソースの回答と取り違えないようにする。
+    var key = sourceKey + ':' + c;
+    if (!agg.factorAnswers[key]) agg.factorAnswers[key] = { plus: 0, minus: 0 };
+    if (POSITIVE_LABELS.indexOf(v) >= 0) agg.factorAnswers[key].plus++;
+    else agg.factorAnswers[key].minus++;
   }
 }
 
-function extractStoreCodeFromRow_(role, row) {
-  // 社員・役職Ptn / パート・アルバイト / FC: 2列目が "コード_店舗名_直FC_ブランド" 形式
-  // 店長: 2列目が店舗コード単独
-  var raw = row[1];
+function extractStoreCodeFromRow_(layout, row) {
+  // 社員・役職Ptn / パート・アルバイト / FC: 指定列が「コード_店舗名_直FC_ブランド」形式
+  // 店長: 指定列が店舗コード単独
+  var raw = row[layout.storeCodeCol];
   if (raw === undefined || raw === null || raw === '') return null;
   var s = String(raw);
   var underscoreIdx = s.indexOf('_');
@@ -101,10 +119,37 @@ function extractStoreCodeFromRow_(role, row) {
   return m ? m[0] : null;
 }
 
-function extractNpsScoreFromRow_(role, row) {
-  // 推奨度設問は各アンケートで3列目(店長のみ4列目)に位置する
-  var idx = role === '店長' ? 4 : 2;
-  return row[idx];
+/**
+ * 起動時に一度だけ、想定した列レイアウトが実際のヘッダーと一致しているかを
+ * 検証する。ズレていた場合は集計を開始せずエラーで止める(サイレントな
+ * 集計ミスを防ぐため)。
+ */
+function validateSurveyLayouts_() {
+  var inputFolder = getInputFolder_();
+  var npsHeaderKeyword = 'おすすめ';
+  var factorHeaderSuffix = '（要因）';
+
+  SURVEY_SOURCES.forEach(function (src) {
+    var file = findFileByNameContains_(inputFolder, src.nameContains);
+    if (!file) throw new Error('入力ファイルが見つかりません: ' + src.nameContains);
+    var layout = SURVEY_LAYOUT_[src.key];
+
+    var blob = file.getBlob();
+    var text = blob.getDataAsString('UTF-8');
+    var firstLine = text.substring(0, Math.min(text.length, 200000));
+    var headerRow = Utilities.parseCsv(firstLine)[0];
+
+    var npsHeader = String(headerRow[layout.npsCol] || '');
+    if (npsHeader.indexOf(npsHeaderKeyword) < 0) {
+      throw new Error('列レイアウト検証エラー(' + src.key + '): npsCol=' + layout.npsCol +
+        ' の見出しに「' + npsHeaderKeyword + '」が含まれません。実際: ' + npsHeader.substring(0, 60));
+    }
+    var factorHeader = String(headerRow[layout.factorStartCol] || '');
+    if (factorHeader.indexOf(factorHeaderSuffix) < 0) {
+      throw new Error('列レイアウト検証エラー(' + src.key + '): factorStartCol=' + layout.factorStartCol +
+        ' の見出しが要因設問(「' + factorHeaderSuffix + '」)ではありません。実際: ' + factorHeader.substring(0, 60));
+    }
+  });
 }
 
 function finalizeStoreAggregates_(storeAgg, config) {

@@ -48,6 +48,47 @@ function updateConfigFolderIds_() {
 }
 
 /**
+ * 列マッピング修正後、今回すでに出力した成果物と中間データを全て削除し、
+ * ジョブ状態を初期化して最初から発行テストをやり直せるようにする。
+ * (入力ファイル配置用と集計ロジック.xlsxはそのまま残す)
+ */
+function resetOutputsAndJob() {
+  var deleted = 0;
+  [getSummaryFolder_(), getStoreReportFolder_(), getAmReportFolder_(), getBReportFolder_()].forEach(function (folder) {
+    deleted += trashAllFilesRecursive_(folder);
+  });
+
+  var props = PropertiesService.getScriptProperties();
+  ['STAGING_SHEET_ID', 'RESOLVED_STORES_SHEET_ID', 'SUMMARY_SHEET_ID', 'ZERO_RESPONSE_STORES',
+    'SURVEY_HEADERS', 'RENDER_SHEET_ID'].forEach(function (key) {
+    var id = props.getProperty(key);
+    if (id) {
+      try { DriveApp.getFileById(id).setTrashed(true); } catch (e) { /* 既に削除済み等は無視 */ }
+    }
+    props.deleteProperty(key);
+  });
+
+  resetJob();
+  appendRunLog_('RESET_OUTPUTS_AND_JOB', 'deletedFiles=' + deleted);
+  Logger.log('出力と中間データを削除し、ジョブを初期化しました(%s件のファイルを削除)', deleted);
+  return deleted;
+}
+
+function trashAllFilesRecursive_(folder) {
+  var count = 0;
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    files.next().setTrashed(true);
+    count++;
+  }
+  var subFolders = folder.getFolders();
+  while (subFolders.hasNext()) {
+    count += trashAllFilesRecursive_(subFolders.next());
+  }
+  return count;
+}
+
+/**
  * 稼働数バグ修正後、店舗確定とサマリだけを作り直すためのパッチ関数。
  * (ジョブ全体を再実行せずに済むよう、実行中のジョブとは独立して動かす)
  */

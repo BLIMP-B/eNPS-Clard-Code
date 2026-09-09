@@ -17,7 +17,10 @@ var SURVEY_SOURCES = [
 ];
 
 function ingestSurveysPhase_(state, config, deadline) {
-  if (!state.cursor.sourceIndex) state.cursor.sourceIndex = 0;
+  if (!state.cursor.sourceIndex) {
+    validateSurveyLayouts_(); // 列レイアウトのズレをここで検出して止める
+    state.cursor.sourceIndex = 0;
+  }
   if (!state.cursor.byteOffset) state.cursor.byteOffset = 0;
   if (!state.cursor.headerBySource) state.cursor.headerBySource = {};
   if (!state.cursor.pendingTail) state.cursor.pendingTail = {};
@@ -41,7 +44,21 @@ function ingestSurveysPhase_(state, config, deadline) {
     saveJobState_(state);
   }
 
+  saveSurveyHeaders_(state.cursor.headerBySource);
   return { done: true };
+}
+
+/**
+ * 各アンケートのヘッダー行(要因設問の実際の見出し文言)をScript Propertiesへ
+ * 保存する。レポート生成フェーズで要因スコアに実際の設問文を表示するために使う。
+ */
+function saveSurveyHeaders_(headerBySource) {
+  PropertiesService.getScriptProperties().setProperty('SURVEY_HEADERS', JSON.stringify(headerBySource));
+}
+
+function loadSurveyHeaders_() {
+  var raw = PropertiesService.getScriptProperties().getProperty('SURVEY_HEADERS');
+  return raw ? JSON.parse(raw) : {};
 }
 
 /**

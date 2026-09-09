@@ -21,8 +21,9 @@ function buildSummaryPhase_(state, config, deadline) {
 
   var sheet = ss.getSheets()[0];
   sheet.setName('実施店舗一覧');
+  // 読み取り専用ディレクトリの第32回実績にある実施店舗一覧.xlsxと同じ列構成に揃える。
   var header = ['店舗コード', '店舗名', '直営FC', '経営企業名', '業態', '事業部', 'AM', 'ブロック', 'B長',
-    '有効回答数', '稼働数', '回答率', 'NPS'];
+    '対象区分', '有効回答数', '稼働数', '回答率', 'NPS', '店舗PDF', 'AM PDF', 'B長PDF', 'QA状態'];
   sheet.appendRow(header);
 
   var zeroResponseStores = [];
@@ -40,13 +41,16 @@ function buildSummaryPhase_(state, config, deadline) {
     return [
       s.storeCode, s.storeName, s.directOrFc, s.operatingCompany, s.brand, s.businessDivision,
       s.amName, s.block, s.bLeaderName,
+      responseCount === 0 ? '対象外(回答数0)' : '対象',
       responseCount, workforce,
       workforce > 0 ? Math.round(responseRate * 1000) / 10 + '%' : '-',
-      agg.nps === null || agg.nps === undefined ? '-' : agg.nps
+      agg.nps === null || agg.nps === undefined ? '-' : agg.nps,
+      '', '', '', '' // 店舗PDF/AM PDF/B長PDF/QA状態はレポート生成後に埋める
     ];
   });
 
   if (rows.length > 0) sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+  PropertiesService.getScriptProperties().setProperty('SUMMARY_SHEET_ID', ss.getId());
 
   var lowRespText = buildLowResponseText_(zeroResponseStores, lowResponseStores);
   var lowRespFile = DriveApp.createFile('回答数0、極少店舗リスト.txt', lowRespText, MimeType.PLAIN_TEXT);
@@ -144,18 +148,52 @@ function renderTextReportPdf_(title, bodyLines, targetFolder, fileName) {
   return pdfFile;
 }
 
+/**
+ * 要因設問ごとのプラス/マイナス回答数からスコア(プラス回答割合、100点満点)を
+ * 算出し、実際の設問文言を添えてスコア降順で返す。原本PDFの「自店舗比較」表に
+ * 相当する情報(要因スコア降順の一覧)を、チャートではなくテキスト表として示す。
+ */
+function computeFactorScoreRows_(agg) {
+  var headers = loadSurveyHeaders_();
+  var keys = Object.keys(agg.factorAnswers || {});
+  var rows = keys.map(function (key) {
+    var sep = key.lastIndexOf(':');
+    var sourceKey = key.substring(0, sep);
+    var colIdx = Number(key.substring(sep + 1));
+    var counts = agg.factorAnswers[key];
+    var total = counts.plus + counts.minus;
+    var score = total > 0 ? Math.round((counts.plus / total) * 1000) / 10 : null;
+    var headerRow = headers[sourceKey];
+    var label = headerRow && headerRow[colIdx] ? String(headerRow[colIdx]).replace(/（要因）$/, '') : key;
+    return { label: label, plus: counts.plus, minus: counts.minus, score: score };
+  });
+  rows.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+  return rows;
+}
+
 function generateStoreReportPdf_(store, agg, config) {
   var brandFolder = getOrCreateNamedSubfolderOf_(getStoreReportFolder_(), normalizeBrandFolderName_(store.brand));
 
   var title = 'eNPSレポート  ' + store.storeName + '（' + store.storeCode + '）';
   var body = [
-    'AM: ' + (store.amName || '-') + '　ブロック: ' + (store.block || '-'),
-    'B長: ' + (store.bLeaderName || '-'),
+    '所属: ' + (store.directOrFc || '-') + '　業態: ' + (store.brand || '-') + '　事業部: ' + (store.businessDivision || '-'),
+    'AM: ' + (store.amName || '-') + '　ブロック: ' + (store.block || '-') + '　B長: ' + (store.bLeaderName || '-'),
+    '店長: ' + (store.managerName || '-'),
     '',
-    '有効回答数: ' + (agg.responseCount || 0) + '人',
+    '【eNPSの結果】',
+    '有効回答数: ' + (agg.responseCount || 0) + '人 / 稼働数: ' + (store.workforce || '-') + '人',
     'NPS: ' + (agg.nps === null || agg.nps === undefined ? '-' : agg.nps),
-    '推奨: ' + (agg.promoters || 0) + '人　中立: ' + (agg.passives || 0) + '人　批判: ' + (agg.detractors || 0) + '人'
+    '批判: ' + (agg.detractors || 0) + '人　中立: ' + (agg.passives || 0) + '人　推奨: ' + (agg.promoters || 0) + '人',
+    '',
+    '【自店舗比較 要因スコア(プラス回答割合、降順)】'
   ];
+
+  var factorRows = computeFactorScoreRows_(agg);
+  factorRows.forEach(function (r, i) {
+    body.push((i + 1) + '. ' + r.label + '　' + (r.score === null ? '-' : r.score + '点') +
+      '（プラス' + r.plus + '／マイナス' + r.minus + '）');
+  });
+
   var fileName = store.storeCode + '_eNPS_第58期1回(32)_' + store.storeName + '_' + (store.directOrFc || '') + '.pdf';
   return renderTextReportPdf_(title, body, brandFolder, fileName);
 }
