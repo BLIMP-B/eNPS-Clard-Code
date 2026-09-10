@@ -6,6 +6,13 @@
  *
  * - NPS = PROMOTERS/ACCEPTED_RESPONSES - (WEAK_DETRACTORS+STRONG_DETRACTORS)/ACCEPTED_RESPONSES
  *   ACCEPTED_RESPONSES(店舗受理回答数)が分母。推奨度が空欄の受理行も分母に残る。
+ *   指標定義シートの定義: 「COUNT(店舗解決・対象判定・重複処理を通過した回答行)」。
+ *   このうち「対象判定」(LATE_STORE_POLICY=EXCLUDE: 対象店舗一覧にない回答は除外)が
+ *   実装から欠落しており、4アンケート(shain_yakushoku/part_arbeit/fc/tencho)の
+ *   全行をstoreCode一致だけで合算していたため、過去回・対象外店舗の回答が
+ *   混入し回答数が異常に膨らむ不具合があった(例: 実際の対象人数を大きく超える294人)。
+ *   → accumulateRow_ で resolved_stores(当回の対象店舗一覧)に照合し、対象外の
+ *   storeCodeの回答を集計前に除外するよう修正済み(getTargetStoreCodeSet_)。
  * - 要因スコア(BASE_FACTOR) = SUM(因子の5段階リッカート点数)/ACCEPTED_RESPONSES
  *   リッカート点数は 100/75/50/25/1 (とても当てはまる=100 ... 全く当てはまらない=1)。
  *   単純な「プラス回答数÷(プラス+マイナス)」ではない。分母は各アンケート種別
@@ -44,6 +51,10 @@ function aggregatePhase_(state, config, deadline) {
   if (!state.cursor.storeAgg) state.cursor.storeAgg = {}; // storeCode -> 集計中間値
 
   var batchSize = getConfigNumber_(config, 'ROW_BATCH_SIZE', 500);
+  // ACCEPTED_RESPONSES(指標定義)は「店舗解決・対象判定・重複処理を通過した回答行」。
+  // 対象判定: LATE_STORE_POLICY=EXCLUDE のとおり、当回の対象店舗一覧(resolved_stores)
+  // にない店舗コードの回答は集計対象から除外する(過去回・閉店・入力ミス等の混入防止)。
+  var targetStoreCodes = getTargetStoreCodeSet_();
 
   while (state.cursor.aggRow <= lastRow) {
     if (Date.now() >= deadline) return { done: false };
@@ -54,7 +65,7 @@ function aggregatePhase_(state, config, deadline) {
     for (var i = 0; i < range.length; i++) {
       var sourceKey = range[i][1];
       var row = JSON.parse(range[i][2]);
-      accumulateRow_(state.cursor.storeAgg, sourceKey, row);
+      accumulateRow_(state.cursor.storeAgg, sourceKey, row, targetStoreCodes);
     }
 
     state.cursor.aggRow += readCount;
@@ -65,6 +76,17 @@ function aggregatePhase_(state, config, deadline) {
   saveAggregateResults_(state.cursor.storeAgg);
 
   return { done: true };
+}
+
+/**
+ * 当回の対象店舗コード集合(RESOLVE_STORE_MASTERフェーズで確定済みのresolved_stores)を
+ * Setとして返す。対象判定(LATE_STORE_POLICY=EXCLUDE)に使う。
+ */
+function getTargetStoreCodeSet_() {
+  var stores = loadResolvedStores_();
+  var set = {};
+  for (var i = 0; i < stores.length; i++) set[String(stores[i].storeCode)] = true;
+  return set;
 }
 
 function getStagingSheetOrThrow_() {
@@ -90,13 +112,16 @@ var SURVEY_LAYOUT_ = {
 
 /**
  * 1行の回答を店舗別中間集計へ加算する。
+ * targetStoreCodes が渡された場合、対象店舗一覧にないstoreCodeの回答は
+ * 対象判定(LATE_STORE_POLICY=EXCLUDE)により集計から除外する。
  */
-function accumulateRow_(storeAgg, sourceKey, row) {
+function accumulateRow_(storeAgg, sourceKey, row, targetStoreCodes) {
   var layout = SURVEY_LAYOUT_[sourceKey];
   if (!layout) throw new Error('未知のアンケート種別です: ' + sourceKey);
 
   var storeCode = extractStoreCodeFromRow_(layout, row);
   if (!storeCode) return;
+  if (targetStoreCodes && !targetStoreCodes[storeCode]) return; // 対象外店舗の回答は除外
 
   if (!storeAgg[storeCode]) {
     storeAgg[storeCode] = {
